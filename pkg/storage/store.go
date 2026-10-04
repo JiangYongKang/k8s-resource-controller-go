@@ -143,6 +143,38 @@ func (s *Store) Delete(name string) (*v1.Widget, error) {
 	return cur.DeepCopy(), nil
 }
 
+// DeleteWithVersion is the version-conditional form of Delete: the caller
+// supplies the resource version observed at read time and the delete commits
+// only when it still matches the stored version. Rejection order is
+// not-found, already-deleting, stale-version; every rejection leaves no
+// trace — the object keeps its phase, its deletion timestamp stays empty and
+// no new resource version is consumed. An accepted delete keeps the Delete
+// semantics: objects with finalizers become terminating (and stay readable),
+// objects without finalizers are purged, and the version advances by one.
+func (s *Store) DeleteWithVersion(name string, expectedRV int64) (*v1.Widget, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur, ok := s.items[name]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if cur.Metadata.DeletionTimestamp != "" {
+		return nil, ErrDeleting
+	}
+	if cur.Metadata.ResourceVersion != expectedRV {
+		return nil, ErrVersionConflict
+	}
+	cur.Metadata.DeletionTimestamp = time.Now().UTC().Format(time.RFC3339Nano)
+	cur.Metadata.ResourceVersion = s.nextRV()
+
+	if len(cur.Metadata.Finalizers) == 0 {
+		delete(s.items, name)
+		return nil, nil
+	}
+	return cur.DeepCopy(), nil
+}
+
 // RemoveFinalizer drops a finalizer when expectedRV is current. When the last
 // finalizer of a terminating object is removed the object is purged and the
 // returned widget is nil. Missing objects, stale versions and absent

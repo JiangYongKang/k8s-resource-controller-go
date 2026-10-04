@@ -23,6 +23,7 @@ func main() {
 		flaky       = flag.Int("flaky", 2, "number of transient attach failures for demo 'flaky' (demonstrates backoff retry)")
 		drain       = flag.Duration("drain", 5*time.Second, "max graceful drain time after signal")
 		showRejects = flag.Bool("show-rejects", true, "also demonstrate distinguishable write rejections")
+		showBatch   = flag.Bool("show-batch", true, "also demonstrate version-conditional precheck + batch delete")
 	)
 	flag.Parse()
 
@@ -102,14 +103,22 @@ func main() {
 	}
 
 	if deleted && waitForGone(ctx, store, "healthy", 2*time.Second) {
-		fmt.Println("[demo] healthy purged after finalization; send Ctrl-C / SIGTERM to drain and exit (auto-exit in 1s)")
+		fmt.Println("[demo] healthy purged after finalization")
+	} else if deleted {
+		fmt.Println("[demo] shutdown while waiting for finalization")
+	}
+
+	if *showBatch && deleted {
+		demoBatchDelete(c, store)
+	}
+
+	if deleted {
+		fmt.Println("[demo] send Ctrl-C / SIGTERM to drain and exit (auto-exit in 1s)")
 		select {
 		case <-time.After(time.Second):
 			stop()
 		case <-ctx.Done():
 		}
-	} else if deleted {
-		fmt.Println("[demo] shutdown while waiting for finalization")
 	}
 
 	if err := <-runErr; err != nil && !errors.Is(err, context.Canceled) {
@@ -117,6 +126,57 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("[demo] stopped; accepted events processed=%d\n", len(c.EventLog()))
+}
+
+// demoBatchDelete showcases the version-conditional delete path: a read-only
+// precheck per object, then one batch execution whose per-object results
+// match the precheck. "batch-stale" is modified after the read so its delete
+// is rejected with a version conflict while "batch-ok" is accepted.
+func demoBatchDelete(c *controller.Controller, store *storage.Store) {
+	ctx := context.Background()
+	for _, name := range []string{"batch-ok", "batch-stale"} {
+		if _, err := store.Create(&v1.Widget{
+			Metadata: v1.ObjectMeta{Name: name},
+			Spec:     v1.WidgetSpec{Message: "batch-demo"},
+		}); err != nil {
+			panic(err)
+		}
+		c.Submit(controller.Event{Kind: controller.EventUpsert, Name: name})
+	}
+	if !waitFor(ctx, store, "batch-stale", v1.WidgetStatusReady, 5*time.Second) {
+		fmt.Println("[demo] batch objects did not converge in time; skipping batch demo")
+		return
+	}
+
+	ok, _ := store.Get("batch-ok")
+	stale, _ := store.Get("batch-stale")
+	intents := []storage.DeleteIntent{
+		{Name: "batch-ok", ResourceVersion: ok.Metadata.ResourceVersion},
+		{Name: "batch-stale", ResourceVersion: stale.Metadata.ResourceVersion},
+		{Name: "batch-ghost", ResourceVersion: 1},
+	}
+
+	// A concurrent write lands between the caller's read and the delete.
+	if _, err := store.Update("batch-stale", stale.Metadata.ResourceVersion, func(cur *v1.Widget) (*v1.Widget, error) {
+		cur.Spec.Message = "changed-after-read"
+		return cur, nil
+	}); err != nil {
+		panic(err)
+	}
+
+	fmt.Println("[demo] delete precheck:")
+	for _, r := range c.CheckDeleteBatch(intents) {
+		fmt.Printf("[demo]   precheck name=%s outcome=%s reason=%v observed-rv=%d\n",
+			r.Name, r.Outcome, r.Reason, r.ResourceVersion)
+	}
+	fmt.Println("[demo] batch delete execution:")
+	for _, r := range c.DeleteBatch(intents) {
+		fmt.Printf("[demo]   execute name=%s outcome=%s reason=%v rv=%d\n",
+			r.Name, r.Outcome, r.Reason, r.ResourceVersion)
+	}
+	if waitForGone(ctx, store, "batch-ok", 2*time.Second) {
+		fmt.Println("[demo] batch-ok purged after finalization; batch-stale kept (stale version), batch-ghost never existed")
+	}
 }
 
 // waitFor polls until the object reaches phase or ctx ends; false means the
