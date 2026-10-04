@@ -6,7 +6,6 @@ import (
 	"errors"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/highcumontoa/k8s-resource-controller-go/pkg/apis/v1"
 )
@@ -122,6 +121,8 @@ func (s *Store) Update(name string, expectedRV int64, mutate func(cur *v1.Widget
 // Delete marks the object for deletion by setting DeletionTimestamp. An
 // object without finalizers is purged immediately. Deleting a missing object
 // is ErrNotFound; deleting an already terminating object is ErrDeleting.
+// The accepted-delete mutation itself lives in applyDeleteLocked so that
+// DeleteWithVersion shares exactly the same semantics.
 func (s *Store) Delete(name string) (*v1.Widget, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -133,14 +134,7 @@ func (s *Store) Delete(name string) (*v1.Widget, error) {
 	if cur.Metadata.DeletionTimestamp != "" {
 		return nil, ErrDeleting
 	}
-	cur.Metadata.DeletionTimestamp = time.Now().UTC().Format(time.RFC3339Nano)
-	cur.Metadata.ResourceVersion = s.nextRV()
-
-	if len(cur.Metadata.Finalizers) == 0 {
-		delete(s.items, name)
-		return nil, nil
-	}
-	return cur.DeepCopy(), nil
+	return s.applyDeleteLocked(cur), nil
 }
 
 // RemoveFinalizer drops a finalizer when expectedRV is current. When the last

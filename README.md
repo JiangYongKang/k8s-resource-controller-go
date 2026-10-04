@@ -12,6 +12,7 @@
 | --- | --- |
 | `pkg/apis/v1/types.go` | `Widget` 资源、版本/终结器/删除时间戳元数据、状态条件、`AggregatedPhase()` 汇总 |
 | `pkg/storage/store.go` | 进程内存储：单调 resourceVersion、乐观并发、删除中拒绝、终结器移除/清除 |
+| `pkg/storage/delete.go` | 带版本条件的删除、只读删除预检、按名字稳定排序的批量删除 |
 | `pkg/controller/queue.go` | 两层工作队列（延迟堆 + 合并 FIFO）：按键单飞去重、`AddAfter` 退避、关停快进 |
 | `pkg/controller/external.go` | 模拟外部系统：幂等 `EnsureAttach`/`Detach`，真实副作用计数，可预置瞬时失败 |
 | `pkg/controller/controller.go` | 对账循环：finalizer 装配/摘除、状态聚合、指数退避重试、信号后排空 |
@@ -66,6 +67,55 @@
 | 移除一个并不存在的 finalizer | `storage.ErrFinalizerNotFound` | 否 |
 | `mutate` 自身返回错误 | 该错误原样返回 | 否 |
 
+## 带版本条件的删除、预检与批量删除
+
+删除链路在 `Delete` 之外新增一组 API（`pkg/storage/delete.go`），让并发写入现场
+的调用方可以「拿着读取时的版本号放心地删」。
+
+### `DeleteWithVersion(name, expectedRV)`
+
+仅当 `expectedRV` 与当前版本完全一致才执行删除；判定全部发生在任何变更之前：
+
+| 场景 | 返回原因 | 说明 |
+| --- | --- | --- |
+| 对象不存在 | `storage.ErrNotFound` | 与「删除中」明确区分 |
+| 携带版本已过期（含并发删除已抢先被接受） | `storage.ErrVersionConflict` | 调用方读到的是旧世界 |
+| 版本一致但对象已在删除流程中 | `storage.ErrDeleting` | 删除已被（他人）接受 |
+
+- **被拒绝的删除不留任何痕迹**：不设置 `deletionTimestamp`、不领取新版本号、
+  不改动任何字段（见 `TestDeleteWithVersionRejectsStaleWithoutTrace`）。
+- **被接受时维持既有语义**：有 finalizer → 进入可读的 `Terminating`；无
+  finalizer → 立即清除；版本号恰好前进一步。
+- 多个调用方拿同一份读取结果并发删除同一对象时，**最多一个成功**，其余全部
+  拿到 `ErrVersionConflict`（彼此可区分，见
+  `TestConcurrentDeleteWithVersionOnlyOneWins`）。
+
+### `PrecheckDelete(intents)` 与 `BatchDelete(intents)`
+
+- `DeleteIntent{Name, ExpectedRV}` 表示一个删除意图。
+- `PrecheckDelete` 是**只读预检**：在读锁下用与执行完全相同的判定函数
+  （`checkDeleteLocked`）给出每个意图的 `DeleteCheckResult{Allowed, Reason}`，
+  不改动任何状态、不分配版本号。因此「真正执行时每个对象的结果与预检一致」
+  唯一可能的偏差来源是预检之后落入的并发写入。
+- `BatchDelete` 逐个意图在**各自独立的临界区**内判定并执行：某一个对象被并发
+  改动只影响它自己的结果，绝不波及同批其它对象；每个对象都有明确的
+  `DeleteResult{Accepted, Purged, Reason}`——不整批静默跳过，也不合并成一个
+  笼统错误。
+- 两种结果都**按名字稳定排序**，同一组输入重复执行得到一致结论。
+- **重复提交安全**：重放同一批意图时，已被接受的删除会变成
+  `ErrVersionConflict`（版本已前进）或 `ErrNotFound`（已清除）的明确拒绝，
+  不会产生重复副作用，也不会把版本号推进第二次（见
+  `TestBatchDeleteReplayConsistent`）。
+
+### 兼容范围
+
+- 既有 `Delete`（无条件删除）、`Update`、`RemoveFinalizer` 的语义与拒绝原因
+  完全不变；接受删除后的状态流转（`Terminating` → finalizer 移除 → purge）
+  由同一个内部函数 `applyDeleteLocked` 承载，两条删除路径不会分叉。
+- 对账循环无需改动：删除中的对象始终可读为 `Terminating`，普通 `Update` 仍被
+  `ErrDeleting` 拒绝，已接受但未处理的删除事件照常收敛到最终清除（见
+  `controller.TestDeleteEventConvergesThroughQueue`）。
+
 ## 对账、去重与退避重试
 
 - **同一对象任一时刻只有一个对账**：工作队列对 key 做合并——待处理中重复 `Add`
@@ -105,6 +155,10 @@ go test ./... -race -count=3
 # 查看带版本/事件/判定依据的单测日志
 go test ./... -race -v -count=1
 
+# 只看本轮新增的删除链路用例（版本条件删除/预检/批量/重复提交）
+go test ./pkg/storage/ -run 'DeleteWithVersion|Precheck|Batch' -race -v -count=1
+go test ./pkg/controller/ -run 'DeleteEvent|StaleDelete' -race -v -count=1
+
 # 端到端演示：瞬时失败退避、finalizer 删除、三类拒绝、信号排空
 go run ./cmd/demo
 
@@ -122,6 +176,13 @@ attached → status-ready` 的正常流转、`decision=detached → finalizer-re
 | 需求场景 | 测试 |
 | --- | --- |
 | 并发写入冲突，仅一个成功且原因可区分 | `storage.TestConcurrentWritesOnlyOneWins` |
+| 并发删除同一对象，仅一个成功、版本只前进一次 | `storage.TestConcurrentDeleteWithVersionOnlyOneWins` |
+| 过期版本删除被拒且不留痕迹；三类拒绝可区分 | `storage.TestDeleteWithVersionRejectsStaleWithoutTrace`、`controller.TestStaleDeleteRejectedThenFreshDeleteAccepted` |
+| 版本条件删除被接受时维持终结器/立即清除语义 | `storage.TestDeleteWithVersionAcceptedSemantics` |
+| 删除预检只读、按名字排序、逐对象给出理由 | `storage.TestPrecheckDeleteReadOnly` |
+| 批量删除逐对象结果、互不影响、与预检一致 | `storage.TestBatchDeletePerObjectResults` |
+| 同一批删除重复提交无重复副作用、版本不二次推进 | `storage.TestBatchDeleteReplayConsistent` |
+| 删除事件经队列收敛到清除；删除中不可被拉回正常 | `controller.TestDeleteEventConvergesThroughQueue` |
 | 版本过期/对象不存在/删除中拒绝互不混淆 | `storage.TestFinalizerDeletionLifecycle`、`controller.TestDeletionReasonsAreDistinguishable` |
 | 被拒绝写入不改动状态 | `storage.TestUpdateOptimisticConcurrency`、`TestUpdateMissingAndMutatorError` |
 | 同对象单飞、重复事件不重复副作用 | `controller.TestSingleInFlightReconcilePerObject`、`TestDuplicateEventsNoDuplicateSideEffects` |
